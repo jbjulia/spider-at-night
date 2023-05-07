@@ -1,0 +1,848 @@
+<!DOCTYPE html>
+<meta charset="UTF-8">
+<html lang="en">
+<head>
+    <title>Spider at Night</title>
+    <style>
+        body {
+            background-color: #1F1F2E;
+            color: #F5F5F5;
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            text-align: center;
+        }
+
+        h2 {
+            margin-top: 20px;
+        }
+
+        #message {
+            font-weight: bold;
+        }
+
+        .controls {
+            display: flex;
+            justify-content: center;
+            flex-wrap: wrap;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+
+        .slider {
+            width: 150px;
+        }
+    </style>
+    <script id="vshader-source" type="x-shader/x-vertex">
+    attribute vec3 a_coords;
+    attribute vec3 a_normal;
+    uniform mat4 modelView;
+    uniform mat4 projection;
+    varying vec3 v_normal;
+    varying vec3 v_eyeCoords;
+    void main() {
+        vec4 coords = vec4(a_coords,1.0);
+        vec4 eyeCoords = modelView * coords;
+        gl_Position = projection * eyeCoords;
+        v_normal = normalize(a_normal);
+        v_eyeCoords = eyeCoords.xyz/eyeCoords.w;
+    }
+    </script>
+    <script id="fshader-source" type="x-shader/x-fragment">
+        #ifdef GL_FRAGMENT_PRECISION_HIGH
+           precision highp float;
+        #else
+           precision mediump float;
+        #endif
+        struct MaterialProperties {
+            vec4 diffuseColor;
+            vec3 specularColor;
+            vec3 emissiveColor;
+            float specularExponent;
+        };
+        struct LightProperties {
+            bool enabled;
+            vec4 position;
+            vec3 color;
+        };
+        uniform MaterialProperties material; // do two-sided lighting, but assume front and back materials are the same
+        uniform LightProperties lights[4];
+        uniform mat3 normalMatrix;
+        varying vec3 v_normal;
+        varying vec3 v_eyeCoords;
+        vec3 lightingEquation(LightProperties light, MaterialProperties material,
+            vec3 eyeCoords, vec3 N, vec3 V) {
+            // N is normal vector, V is direction to viewer.
+            vec3 L, R; // Light direction and reflected light direction.
+            if (light.position.w == 0.0) {
+                L = normalize(light.position.xyz);
+            } else {
+                L = normalize(light.position.xyz / light.position.w - v_eyeCoords);
+            }
+            if (dot(L, N) <= 0.0) {
+                return vec3(0.0);
+            }
+            vec3 reflection = dot(L, N) * light.color * material.diffuseColor.rgb;
+            R = -reflect(L, N);
+            if (dot(R, V) > 0.0) {
+                float factor = pow(dot(R, V), material.specularExponent);
+                reflection += factor * material.specularColor * light.color;
+            }
+            return reflection;
+        }
+        void main() {
+            vec3 normal = normalize(normalMatrix * v_normal);
+            vec3 viewDirection = normalize(-v_eyeCoords); // (Assumes a perspective projection.)
+            vec3 color = material.emissiveColor;
+            for (int i = 0; i < 4; i++) {
+                if (lights[i].enabled) {
+                    if (gl_FrontFacing) {
+                        color += lightingEquation(lights[i], material, v_eyeCoords,
+                            normal, viewDirection);
+                    } else {
+                        color += lightingEquation(lights[i], material, v_eyeCoords,
+                            -normal, viewDirection);
+                    }
+                }
+            }
+            gl_FragColor = vec4(color, material.diffuseColor.a);
+        }
+    </script>
+    <script src="webgl_/gl-matrix-min.js"></script>
+    <script src="webgl_/trackball-rotator.js"></script>
+    <script src="webgl_/basic-object-models-IFS.js"></script>
+    <script>
+        /* global mat3 */
+        /* global mat4 */
+        /* global vec4 */
+        "use strict";
+
+        // WebGL context
+        let gl;
+
+        // Lights and toggles
+        let moonLight = true;
+        let lampLight = true;
+        let animating = false;
+
+        // Scale
+        let scale = 0.8;
+
+        // WebGL attribute and uniform locations
+        let a_coords_loc;
+        let a_normal_loc;
+        let a_texCoords_loc;
+
+        // Texture
+        let texture;
+
+        // Uniforms for matrices
+        let u_modelView;
+        let u_projection;
+        let u_normalMatrix;
+
+        // Uniforms for material and lights
+        let u_material;
+        let u_lights;
+
+        // Matrices
+        let modelView;
+        const projection = mat4.create();
+        const normalMatrix = mat3.create();
+
+        // Interactivity and animation
+        let rotator;
+        let frameNumber = 0;
+
+        // Geometries
+        let sphere;
+        let cylinder;
+
+        // Matrix stack and current color
+        const matrixStack = [];
+        let currentColor = [1, 1, 1, 1];
+
+        // URL paths to textures
+        const textureURLs = [
+            "webgl_/textures/moon.jpg",
+            "webgl_/textures/brick001.jpg",
+            "webgl_/textures/marble.jpg"
+        ];
+
+        // Load the moon texture and initialize the moonTexture variable
+        let moonTexture;
+        loadTexture(0, function (texture) {
+            moonTexture = texture;
+        });
+
+        /**
+         * Draws the image, which consists of either the "world" or a closeup of the "car".
+         */
+        function draw() {
+            // Clear the buffers and set the clear color
+            gl.clearColor(0, 0, 0.1, 1);
+            gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+            // Set up the projection matrix
+            mat4.perspective(projection, Math.PI / 4, 1, 1, 50);
+            gl.uniformMatrix4fv(u_projection, false, projection);
+
+            // Get the model view matrix
+            modelView = rotator.getViewMatrix();
+
+            // Push the current matrix on the stack
+            pushMatrix();
+
+            // Scale the model view matrix
+            mat4.scale(modelView, modelView, [scale, scale, scale]);
+
+            // Draw the lights
+            lights();
+
+            // Draw the world
+            world();
+
+            // Pop the matrix from the stack
+            popMatrix();
+        }
+
+        /**
+         * Creates the World
+         */
+        function world() {
+            // Draw the ground
+            ground();
+
+            // Draw the tree
+            tree();
+
+            // Push the current matrix on the stack
+            pushMatrix();
+
+            // Translate and rotate the model view matrix
+            mat4.translate(modelView, modelView, [2, 0, 0]);
+            mat4.rotate(modelView, modelView, (frameNumber) / 180 * Math.PI, [0, 1, 0]);
+
+            // Draw the bug
+            bug();
+
+            // Pop the matrix from the stack
+            popMatrix();
+        }
+
+        /**
+         * Creates the Ground
+         */
+        function ground() {
+            // Draw the grass
+            pushMatrix();
+
+            // Translate, rotate, and scale the model view matrix
+            mat4.translate(modelView, modelView, [0, -0.125, 0]);
+            mat4.rotate(modelView, modelView, (90) / 180 * Math.PI, [1, 0, 0]);
+            mat4.scale(modelView, modelView, [10, 10, 0.25]);
+
+            // Set the current color for the grass
+            currentColor = [0.3, 0.9, 0.3, 1];
+
+            // Render the grass sphere
+            sphere.render();
+
+            // Pop the matrix from the stack
+            popMatrix();
+        }
+
+        /**
+         * Draws a tree using a cylinder for the trunk, spheres for the leaves, and apples on the leaves.
+         */
+        function tree() {
+            // Draw the trunk
+            pushMatrix();
+            mat4.translate(modelView, modelView, [-3, 2, -2]);
+            mat4.translate(modelView, modelView, [0, 2, 0]);
+            mat4.rotate(modelView, modelView, (90) / 180 * Math.PI, [1, 0, 0]);
+            mat4.scale(modelView, modelView, [0.5, 0.5, 2]);
+            currentColor = [0.6, 0.3, 0.1, 1];
+            cylinder.render();
+            popMatrix();
+
+            // Draw the leaves and apples
+            const leafPositions = [
+                [-3, 0.5, -2],
+                [-3, 1.5, -2],
+                [-3, 2.5, -2]
+            ];
+
+            const applePositions = [
+                [-3.8, 1.5, -1.4],
+                [-2.2, 2.3, -1.4],
+                [-2.2, 0.7, -1.4],
+            ];
+
+            for (let i = 0; i < leafPositions.length; i++) {
+                const leafPos = leafPositions[i];
+                const applePos = applePositions[i];
+
+                pushMatrix();
+                mat4.translate(modelView, modelView, leafPos);
+                mat4.translate(modelView, modelView, [0, 2, 0]);
+                mat4.scale(modelView, modelView, [1, 1, 1]);
+                currentColor = [0.1, 0.7, 0.2, 1];
+                sphere.render();
+
+                // Draw the apple on the outside of the leaf sphere
+                pushMatrix();
+                mat4.translate(modelView, modelView, [applePos[0] - leafPos[0], applePos[1] - leafPos[1], applePos[2] - leafPos[2]]);
+                mat4.scale(modelView, modelView, [0.2, 0.2, 0.2]);
+                currentColor = [1, 0, 0, 1];
+                sphere.render();
+                popMatrix();
+
+                popMatrix();
+            }
+        }
+
+        /**
+         * Draws a bug using a sphere for the body, spheres for the eyes, and cylinders for the legs.
+         */
+        function bug() {
+            // Draw the body
+            pushMatrix();
+            mat4.translate(modelView, modelView, [1, 0.3, 1]);
+            mat4.rotate(modelView, modelView, (90) / 180 * Math.PI, [1, 0, 0]);
+            mat4.scale(modelView, modelView, [0.2, 0.2, 0.2]);
+            currentColor = [0.0, 0.0, 0.0, 1.0];
+            sphere.render();
+            popMatrix();
+
+            // Draw the eyes
+            const eyePositions = [
+                [1.1, 0.4, 0.83],
+                [0.9, 0.4, 0.83]
+            ];
+
+            for (const position of eyePositions) {
+                pushMatrix();
+                mat4.translate(modelView, modelView, position);
+                mat4.scale(modelView, modelView, [0.06, 0.06, 0.06]);
+                currentColor = [1.0, 0.0, 0.0, 1.0];
+                gl.uniform3f(u_material.emissiveColor, lampLight ? 0.6 : 0.2, 0, 0);
+                sphere.render();
+                gl.uniform3f(u_material.emissiveColor, 0, 0, 0);
+                popMatrix();
+            }
+
+            // Draw the legs
+            pushMatrix();
+            mat4.translate(modelView, modelView, [1, 0.17, 1]);
+            for (let i = 0; i < 8; i++) {
+                pushMatrix();
+                mat4.rotate(modelView, modelView, i * (360 / 8) / 180 * Math.PI, [0, 1, 0]);
+                mat4.rotate(modelView, modelView, -90 / 180 * Math.PI, [1, 0, 0]);
+                mat4.translate(modelView, modelView, [0, -0.3, 0]);
+                mat4.scale(modelView, modelView, [0.05, 0.4, 0.05]);
+                currentColor = [0.0, 0.0, 0.0, 1.0];
+                cylinder.render();
+                popMatrix();
+            }
+            popMatrix();
+
+            // Draw additional eyes if both moon and lamp are off
+            if (!moonLight && !lampLight) {
+                drawAdditionalEyes();
+            }
+        }
+
+        /**
+         * Draws additional eyes for the bug when both moon and lamp lights are off.
+         */
+        function drawAdditionalEyes() {
+            // Define the positions of the additional eye pairs
+            const additionalEyePairs = [
+                [
+                    [-1, 0.4, 0],
+                    [-0.87, 0.4, 0]
+                ],
+                [
+                    [-1, 0.4, 2],
+                    [-0.87, 0.4, 2]
+                ],
+                [
+                    [2, 0.4, 2],
+                    [2.13, 0.4, 2]
+                ],
+                [
+                    [2, 0.4, 0],
+                    [2.13, 0.4, 0]
+                ],
+                [
+                    [-1, 0.4, -1],
+                    [-0.87, 0.4, -1]
+                ],
+                [
+                    [-1, 0.4, 3],
+                    [-0.87, 0.4, 3]
+                ],
+                [
+                    [3, 0.4, 3],
+                    [3.13, 0.4, 3]
+                ],
+                [
+                    [3, 0.4, -1],
+                    [3.13, 0.4, -1]
+                ],
+                [
+                    [-3, 0.4, 0],
+                    [-2.87, 0.4, 0]
+                ],
+                [
+                    [-3, 0.4, 2],
+                    [-2.87, 0.4, 2]
+                ],
+                [
+                    [4, 0.4, 2],
+                    [4.13, 0.4, 2]
+                ],
+                [
+                    [4, 0.4, 0],
+                    [4.13, 0.4, 0]
+                ],
+                [
+                    [-3, 0.4, -1],
+                    [-2.87, 0.4, -1]
+                ],
+                [
+                    [-3, 0.4, 3],
+                    [-2.87, 0.4, 3]
+                ],
+                [
+                    [5, 0.4, 3],
+                    [5.13, 0.4, 3]
+                ],
+                [
+                    [5, 0.4, -1],
+                    [5.13, 0.4, -1]
+                ],
+            ];
+
+            // Iterate through the additional eye pairs and draw the eyes
+            for (const eyePair of additionalEyePairs) {
+                // Draw the first eye of the pair
+                pushMatrix();
+                mat4.translate(modelView, modelView, eyePair[0]);
+                mat4.scale(modelView, modelView, [0.06, 0.06, 0.06]);
+                currentColor = [1.0, 0.0, 0.0, 1.0];
+                gl.uniform3f(u_material.emissiveColor, 0.2, 0, 0);
+                sphere.render();
+                gl.uniform3f(u_material.emissiveColor, 0, 0, 0);
+                popMatrix();
+
+                // Draw the second eye of the pair
+                pushMatrix();
+                mat4.translate(modelView, modelView, eyePair[1]);
+                mat4.scale(modelView, modelView, [0.06, 0.06, 0.06]);
+                currentColor = [1.0, 0.0, 0.0, 1.0];
+                gl.uniform3f(u_material.emissiveColor, 0.2, 0, 0);
+                sphere.render();
+                gl.uniform3f(u_material.emissiveColor, 0, 0, 0);
+                popMatrix();
+            }
+        }
+
+        /**
+         * Configures and draws the lamp light, moonlight, and lamp post.
+         */
+        function lights() {
+            // Lamp Light
+            gl.uniform1i(u_lights[0].enabled, lampLight ? 1 : 0);
+            gl.uniform3f(u_lights[0].color, 0.5, 0.5, 0.5)
+            gl.uniform1f(u_lights[0].attenuation, 2);
+
+            // Moon Light
+            gl.uniform1i(u_lights[1].enabled, moonLight ? 1 : 0);
+            gl.uniform3f(u_lights[1].color, 0.1, 0.1, 0.4);
+            gl.uniform1f(u_lights[1].attenuation, 2);
+
+            currentColor = [0.3, 0.3, 0.3, 1];
+
+            // Draw lamp light
+            pushMatrix();
+            mat4.translate(modelView, modelView, [2, 1.4, 0]);
+            mat4.scale(modelView, modelView, [0.15, 0.15, 0.15]);
+            setLightPosition(u_lights[0].position, modelView, [0, 0, 0, 1]);
+
+            // Change the emissive color based on whether the lamp is toggled on or off
+            if (lampLight) {
+                gl.uniform3f(u_material.emissiveColor, 0.6, 0.6, 0.1);
+            } else {
+                gl.uniform3f(u_material.emissiveColor, 0.2, 0.2, 0.1);
+            }
+
+            sphere.render();
+            gl.uniform3f(u_material.emissiveColor, 0, 0, 0);
+            popMatrix();
+
+            // Draw moon
+            pushMatrix();
+            mat4.translate(modelView, modelView, [-7, 5, -3]);
+            mat4.scale(modelView, modelView, [1, 1, 1]);
+            setLightPosition(u_lights[1].position, modelView, [0, 0, 0, 1]);
+            gl.uniform3f(u_material.emissiveColor, moonLight ? 0.2 : 0.1, 0.2, 0.4);
+
+            // Enable the texture mapping and pass the texture to the shader
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, moonTexture);
+            gl.uniform1i(u_material.texture, 0);
+
+            // Modify the sphere.render() call for the moon to use the texture
+            sphere.render(true); // Pass 'true' to enable texture mapping for the sphere
+
+            gl.bindTexture(gl.TEXTURE_2D, null);
+            gl.uniform3f(u_material.emissiveColor, 0, 0, 0);
+            popMatrix();
+
+            // Draw lamp post
+            pushMatrix();
+            mat4.translate(modelView, modelView, [2, 2.5, 0]);
+            mat4.rotate(modelView, modelView, (90) / 180 * Math.PI, [1, 0, 0]);
+            mat4.scale(modelView, modelView, [0.15, 0.15, 1.25]);
+            currentColor = [0.5, 0.5, 0.5, 1];
+            cylinder.render();
+            popMatrix();
+        }
+
+        /**
+         * Sets the light position for a given light in the shader using the modelView matrix.
+         * @param {WebGLUniformLocation} u_position_loc - The location of the light position uniform in the shader.
+         * @param {mat4} modelView - The modelView matrix to apply to the light position.
+         * @param {Array<number>} lightPosition - The light position in the form of an array [x, y, z, w].
+         */
+        function setLightPosition(u_position_loc, modelView, lightPosition) {
+            const transformedPosition = new Float32Array(4);
+            vec4.transformMat4(transformedPosition, lightPosition, modelView);
+            gl.uniform4fv(u_position_loc, transformedPosition);
+        }
+
+        /**
+         *  Push a copy of the current modelView matrix onto the matrix stack.
+         */
+        function pushMatrix() {
+            matrixStack.push(mat4.clone(modelView));
+        }
+
+        /**
+         *  Restore the modelView matrix to a value popped from the matrix stack.
+         */
+        function popMatrix() {
+            modelView = matrixStack.pop();
+        }
+
+        /**
+         * Creates a 3D model using the provided model data and, if specified, an extra translation.
+         * @param {Object} modelData - The model data containing vertex positions, normals, and indices.
+         * @param {number[]} extraTranslate - Optional extra translation to apply to the model.
+         * @returns {Object} The created 3D model with a render function.
+         */
+        function createModel(modelData, extraTranslate) {
+            const model = {};
+            model.coordsBuffer = gl.createBuffer();
+            model.normalBuffer = gl.createBuffer();
+            model.indexBuffer = gl.createBuffer();
+            model.count = modelData.indices.length;
+
+            if (extraTranslate) {
+                model.xtraTranslate = extraTranslate;
+            } else {
+                model.xtraTranslate = null;
+            }
+
+            gl.bindBuffer(gl.ARRAY_BUFFER, model.coordsBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, modelData.vertexPositions, gl.STATIC_DRAW);
+            gl.bindBuffer(gl.ARRAY_BUFFER, model.normalBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, modelData.vertexNormals, gl.STATIC_DRAW);
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, model.indexBuffer);
+            gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, modelData.indices, gl.STATIC_DRAW);
+
+            model.render = function () {
+                gl.bindBuffer(gl.ARRAY_BUFFER, this.coordsBuffer);
+                gl.vertexAttribPointer(a_coords_loc, 3, gl.FLOAT, false, 0, 0);
+                gl.bindBuffer(gl.ARRAY_BUFFER, this.normalBuffer);
+                gl.vertexAttribPointer(a_normal_loc, 3, gl.FLOAT, false, 0, 0);
+                gl.uniform4fv(u_material.diffuseColor, currentColor);
+
+                if (this.xtraTranslate) {
+                    pushMatrix();
+                    mat4.translate(modelView, modelView, this.xtraTranslate);
+                }
+
+                gl.uniformMatrix4fv(u_modelView, false, modelView);
+                mat3.normalFromMat4(normalMatrix, modelView);
+                gl.uniformMatrix3fv(u_normalMatrix, false, normalMatrix);
+                gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
+                gl.drawElements(gl.TRIANGLES, this.count, gl.UNSIGNED_SHORT, 0);
+
+                if (this.xtraTranslate) {
+                    popMatrix();
+                }
+            };
+
+            return model;
+        }
+
+        /**
+         * Creates a WebGL program from the given vertex and fragment shader script elements.
+         * @param {WebGLRenderingContext} gl - The WebGL rendering context.
+         * @param {string} vertexShaderID - The ID of the script element containing the vertex shader source code.
+         * @param {string} fragmentShaderID - The ID of the script element containing the fragment shader source code.
+         * @returns {WebGLProgram} The created WebGL program.
+         * @throws {Error} If there is an issue with shader compilation or program linking.
+         */
+        function createProgram(gl, vertexShaderID, fragmentShaderID) {
+            const fragmentShaderSource = getTextContent(fragmentShaderID);
+            const vertexShaderSource = getTextContent(vertexShaderID);
+
+            function getTextContent(elementID) {
+                const element = document.getElementById(elementID);
+                let node = element.firstChild;
+                let str = "";
+                while (node) {
+                    if (node.nodeType === 3) // text node
+                        str += node.textContent;
+                    node = node.nextSibling;
+                }
+                return str;
+            }
+
+            try {
+            } catch (e) {
+                throw "Error: Could not get shader source code from script elements.";
+            }
+
+            const vsh = gl.createShader(gl.VERTEX_SHADER);
+            gl.shaderSource(vsh, vertexShaderSource);
+            gl.compileShader(vsh);
+
+            if (!gl.getShaderParameter(vsh, gl.COMPILE_STATUS)) {
+                throw "Error in vertex shader:  " + gl.getShaderInfoLog(vsh);
+            }
+
+            const fsh = gl.createShader(gl.FRAGMENT_SHADER);
+            gl.shaderSource(fsh, fragmentShaderSource);
+            gl.compileShader(fsh);
+
+            if (!gl.getShaderParameter(fsh, gl.COMPILE_STATUS)) {
+                throw "Error in fragment shader:  " + gl.getShaderInfoLog(fsh);
+            }
+
+            const program = gl.createProgram();
+            gl.attachShader(program, vsh);
+            gl.attachShader(program, fsh);
+            gl.linkProgram(program);
+
+            if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+                throw "Link error in program:  " + gl.getProgramInfoLog(program);
+            }
+
+            return program;
+        }
+
+        /**
+         * Loads a texture from a given texture number and calls the callback function with the created texture.
+         * @param {number} textureNum - The index of the texture in the textureURLs array.
+         * @param {function} callback - The callback function to be called with the created texture.
+         */
+        function loadTexture(textureNum, callback) {
+            const img = new Image();
+            img.onload = function () {
+                const texture = gl.createTexture();
+                gl.bindTexture(gl.TEXTURE_2D, texture);
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+                gl.generateMipmap(gl.TEXTURE_2D);
+                callback(texture);
+                draw(); // Call the draw() function after the texture has been loaded
+            };
+            img.onerror = function () {
+                document.getElementById("message").innerHTML =
+                    "<p>Sorry, texture image could not be loaded.</p>";
+                draw();
+            };
+            img.src = textureURLs[textureNum];
+        }
+
+        /**
+         * Initializes WebGL, sets up shaders, and loads the texture.
+         * @param {number} textureNum - The index of the texture to load.
+         * @param {function} callback - The callback function to execute after the texture is loaded.
+         */
+        function initGL(textureNum, callback) {
+            let i;
+            const program = createProgram(gl, "vshader-source", "fshader-source");
+            gl.useProgram(program);
+            gl.enable(gl.DEPTH_TEST);
+
+            a_coords_loc = gl.getAttribLocation(program, "a_coords");
+            a_normal_loc = gl.getAttribLocation(program, "a_normal");
+            a_texCoords_loc = gl.getAttribLocation(program, "a_texCoords");
+            gl.enableVertexAttribArray(a_coords_loc);
+            gl.enableVertexAttribArray(a_normal_loc);
+            gl.enableVertexAttribArray(a_texCoords_loc);
+
+            texture = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+
+            u_modelView = gl.getUniformLocation(program, "modelView");
+            u_projection = gl.getUniformLocation(program, "projection");
+            u_normalMatrix = gl.getUniformLocation(program, "normalMatrix");
+            u_material = {
+                diffuseColor: gl.getUniformLocation(program, "material.diffuseColor"),
+                specularColor: gl.getUniformLocation(program, "material.specularColor"),
+                emissiveColor: gl.getUniformLocation(program, "material.emissiveColor"),
+                specularExponent: gl.getUniformLocation(program, "material.specularExponent"),
+                texture: gl.getUniformLocation(program, "material.texture") // add this line
+            };
+            u_lights = new Array(4);
+            for (i = 0; i < 4; i++) {
+                u_lights[i] = {
+                    enabled: gl.getUniformLocation(program, "lights[" + i + "].enabled"),
+                    position: gl.getUniformLocation(program, "lights[" + i + "].position"),
+                    color: gl.getUniformLocation(program, "lights[" + i + "].color")
+                };
+            }
+
+            gl.uniform3f(u_material.specularColor, 0.1, 0.1, 0.1);
+            gl.uniform1f(u_material.specularExponent, 16);
+            gl.uniform3f(u_material.emissiveColor, 0, 0, 0);
+
+            for (i = 1; i < 4; i++) {
+                gl.uniform1i(u_lights[i].enabled, 0);
+                gl.uniform4f(u_lights[i].position, 0, 0, 1, 0);
+                gl.uniform3f(u_lights[i].color, 1, 1, 1);
+            }
+
+            loadTexture(0, callback);
+        }
+
+        /**
+         * Advances the animation and redraws the scene.
+         */
+        function frame() {
+            if (animating) {
+                frameNumber += 1;
+                draw();
+                requestAnimationFrame(frame);
+            }
+        }
+
+        /**
+         * Sets the animation state to on or off.
+         * @param {boolean} run - The animation state to set.
+         */
+        function setAnimating(run) {
+            if (run !== animating) {
+                animating = run;
+                if (animating)
+                    requestAnimationFrame(frame);
+            }
+        }
+
+        /**
+         * Sets the scale of the scene and redraws it.
+         */
+        function scaleScene() {
+            scale = document.getElementById("scaleSlider").value;
+            draw();
+        }
+
+        /**
+         * Toggles the moon light on or off and redraws the scene.
+         */
+        function moonToggle() {
+            moonLight = !moonLight;
+            draw();
+        }
+
+        /**
+         * Toggles the lamp light on or off and redraws the scene.
+         */
+        function lampToggle() {
+            lampLight = !lampLight;
+            draw();
+        }
+
+        /**
+         * Initializes the WebGL graphics context, sets up event listeners for user interaction, creates models, and
+         * draws the initial scene.
+         * @param {number} textureNum - the index of the texture to be loaded
+         * @param {Function} callback - function to be called once the texture is loaded
+         */
+        function init(textureNum, callback) {
+            const canvas = document.getElementById("webglcanvas");
+
+            // Check if the browser supports WebGL
+            gl = canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
+            if (!gl) {
+                document.getElementById("message").innerHTML =
+                    "<p>Sorry, your browser does not support WebGL.</p>";
+                return;
+            }
+
+            // Initialize WebGL graphics context
+            try {
+                initGL(textureNum, callback);
+            } catch (e) {
+                document.getElementById("message").innerHTML =
+                    "<p>Sorry, could not initialize the WebGL graphics context:" + e + "</p>";
+                return;
+            }
+
+            // Set up event listeners for user interaction
+            document.getElementById("moonLight").checked = true;
+            document.getElementById("lampLight").checked = true;
+            document.getElementById("moonLight").onclick = moonToggle;
+            document.getElementById("lampLight").onclick = lampToggle;
+            document.getElementById("animCheck").checked = false;
+            document.getElementById("scaleSlider").onchange = scaleScene;
+            document.getElementById("reset").onclick = function () {
+                rotator.setView(17, [0, 1, 2]);
+                frameNumber = 0;
+                animating = false;
+                document.getElementById("animCheck").checked = false;
+                document.getElementById("scaleSlider").value = 0.8;
+                scaleScene();
+                draw();
+            };
+
+            // Create models and initialize trackball rotator
+            sphere = createModel(uvSphere(1), null);
+            cylinder = createModel(uvCylinder(), [0, 0, 1.5]);
+            rotator = new TrackballRotator(canvas, function () {
+                if (!animating) draw();
+            }, 17, [0, 1, 2]);
+
+            // Draw the initial scene
+            draw();
+        }
+    </script>
+</head>
+<body onload="init(0, null)">
+<h2>Spider at Night</h2>
+<p id="message">To rotate the model, click and drag your mouse on it. You can toggle elements by checking or unchecking
+    the corresponding checkboxes, and adjust the scale using the slider.</p>
+<noscript>
+    <hr>
+    <h3>This page requires Javascript and a web browser that supports WebGL</h3>
+    <hr>
+</noscript>
+<div class="controls">
+    <label><input id="animCheck" onchange="setAnimating(this.checked)" type="checkbox"> Animate</label>
+    <label><input id="moonLight" type="checkbox"> Moon Light</label>
+    <label><input id="lampLight" type="checkbox"> Lamp Light</label>
+    <label>Scale:</label><label for="scaleSlider"></label><input class="slider" id="scaleSlider" max="2" min="0.5"
+                                                                 step="0.1" type="range" value="0.8">
+    <button id="reset">Reset Animation</button>
+</div>
+<div>
+    <canvas height="640" id="webglcanvas" style="background-color:black" width="640"></canvas>
+</div>
+</body>
+</html>
